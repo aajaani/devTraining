@@ -16,6 +16,9 @@ Sure 🚀 here’s the whole Angular + FastAPI workflow in **super concise steps
      * `ItemsComponent` → displays items (`*ngFor`, needs `CommonModule`).
      * `ItemFormComponent` → adds items (`[(ngModel)]`, needs `FormsModule`).
    * Imported both into `AppComponent` and used their selectors.
+  
+   * Also gotta import provideHttpClient to app.config
+   * also all the componenets and app.component.ts gotta have standalone=True
 
 3. **Proxy setup**
 

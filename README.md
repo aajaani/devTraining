@@ -19,6 +19,24 @@ Sure 🚀 here’s the whole Angular + FastAPI workflow in **super concise steps
   
    * Also gotta import provideHttpClient to app.config
    * also all the componenets and app.component.ts gotta have standalone=True
+  
+   * If you want a list to immediately update after a post submit, then you have to create another service function called fetchitems that uhh 
+private itemsSubject = new BehaviorSubject<any[]>([]);
+  items$ = this.itemsSubject.asObservable();
+
+  constructor(private http: HttpClient) { };
+  fetchItems() {
+    this.http.get<any[]>('http://localhost:8000/items').subscribe(items => {
+      this.itemsSubject.next(items);
+    });
+  }
+
+  idk
+
+  also the component that renders items has to call this.service.fetchitems() at the end
+
+  and also it must subscribe to items$
+  
 
 3. **Proxy setup**
 

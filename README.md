@@ -544,3 +544,146 @@ uvicorn main:app --reload
 
 Want me to add the **Angular proxy + ApiService setup** next, also in this “required vs optional” + commented style, so the full stack is aligned?
 
+Perfect—here’s the **overhead, “who-calls-whom” map** for the whole project. Think of each line as a one-sentence elevator pitch you can say to the TA.
+
+---
+
+## Frontend (Angular)
+
+* **`app.component.ts/html/css` — UI & state**
+
+  * **Role:** The screen the user sees: form (title, text, username, image), post list, up/down buttons, error popup.
+  * **Calls →** `post.service.ts` for every network action.
+  * **Called by →** the browser (user interactions).
+
+* **`post.service.ts` — HTTP client**
+
+  * **Role:** Small wrapper around `HttpClient` so components don’t know about URLs or payload shapes.
+  * **Calls →** backend endpoints: `GET /post`, `POST /post` (as `FormData`), `POST /update-post-score`; builds `/image/{hash}` URLs.
+  * **Called by →** `app.component`.
+
+* **`post.model.ts` — shared shape**
+
+  * **Role:** TypeScript interface that mirrors backend JSON (`id, title, post, score, username, image_hash?`).
+  * **Used by →** `app.component`, `post.service`.
+
+* **`proxy.conf.json` — dev proxy**
+
+  * **Role:** Sends `/post`, `/update-post-score`, `/image/*` to `http://localhost:8000` so no CORS needed in dev.
+  * **Used by →** Angular dev server.
+
+---
+
+## Backend – API & wiring
+
+* **`main.py` — FastAPI app (endpoints + startup)**
+
+  * **Role:** Owns the HTTP API; on startup ensures DB tables and MinIO bucket exist.
+  * **Exposes →** `GET /post`, `POST /post` (form + optional file), `POST /update-post-score`, `GET /image/{hash}`.
+  * **Calls →** `Depends(get_service(PostService))` to delegate to business logic; uses `get_minio()` in `/image`.
+  * **Returns →** JSON posts or streamed image bytes.
+  * **Raises →** `BaseCustomException` for uniform, user-friendly errors.
+
+* **`dependencies.py` — DI & MinIO**
+
+  * **Role:** One place to construct the MinIO client, ensure the bucket, and wire services with repositories and the request-scoped DB session.
+  * **Provides →** `get_minio()`, `ensure_bucket()`, `get_service(ServiceType)`.
+
+* **`core/exceptions.py` — error shape**
+
+  * **Role:** Standardizes errors to `{ detail: { user_message, internal_message } }` so the frontend can always show a good popup.
+  * **Used by →** routes, services, repos when something goes wrong.
+
+---
+
+## Backend – domain & data
+
+* **`services/posts_service.py` — business logic**
+
+  * **Role:** Implements the app rules that endpoints need.
+  * **Calls →**
+
+    * On create: hashes file (if present) and **uploads to MinIO**; then calls repo to **INSERT** a post with `image_hash`.
+    * On list: calls repo to **SELECT** posts.
+    * On vote: calls repo to **atomically UPDATE** score.
+  * **Used by →** `main.py` via DI.
+
+* **`repositories/post_repository.py` — DB CRUD**
+
+  * **Role:** Talks SQLAlchemy to the database; no HTTP or business rules here.
+  * **Implements →** `create_post(...)`, `get_all_posts()`, `update_post_score(...)` with `score = score + :inc` (single atomic SQL).
+  * **Calls →** SQLAlchemy session/engine.
+  * **Used by →** `posts_service`.
+
+* **`schemas/requests.py` — request validation**
+
+  * **Role:** Pydantic models that define what the API **accepts**.
+  * **Enforces →** `AddNewPostRequest`: title **required** & **≤100**, post **required**, username default `"anonymous"`.
+    `UpdatePostScoreRequest`: `post_id` int, `score_increase ∈ {+1, -1}`.
+  * **Used by →** `main.py` (FastAPI auto-validates & documents).
+
+* **`db/models.py` — ORM tables**
+
+  * **Role:** SQLAlchemy model `SavedPost(id, title, username='anonymous', post, score=0, image_hash?)`.
+  * **Used by →** repository queries and updates.
+
+* **`db/database.py` — engine & session**
+
+  * **Role:** Builds the DB engine and `SessionLocal`; gives FastAPI a `get_db()` dependency.
+  * **Also →** `create_tables()` executes `db/db_init/init.sql` (idempotent).
+  * **Used by →** DI (to inject sessions), startup.
+
+* **`config.py` — settings**
+
+  * **Role:** Central source of Postgres & MinIO host/creds (env-driven; safe defaults for local dev).
+  * **Used by →** DB and MinIO setup.
+
+---
+
+## Persistence & images
+
+* **PostgreSQL (container + named volume)**
+
+  * **Role:** Stores posts and scores; survives restarts.
+  * **Key detail:** Voting is concurrency-safe because the repository uses **one atomic SQL UPDATE** (`score = score + inc`).
+
+* **MinIO (container + named volume)**
+
+  * **Role:** Stores image **bytes** under `images/{sha256}`; survives restarts.
+  * **Access path:** Frontend loads images via `GET /image/{hash}` which streams from MinIO.
+
+---
+
+## Quality & verification
+
+* **`.gitlab-ci.yml` — CI/CD**
+
+  * **Role:** Runs **hello → lint → test → format** for **both** frontend and backend; any failure fails the pipeline (fail-fast).
+  * **Frontend gates:** `ng build`, `ng lint` (ESLint), `prettier --check`.
+  * **Backend gates:** import/hello, `ruff`, `pytest`, `black --check`.
+
+* **`backend/tests/test_posts.py` — sanity tests**
+
+  * **Role:** Quick unit tests for defaults, listing, and vote (+1 then −1 → 0).
+  * **Demo tip:** To show a failing test, temporarily invert `+ inc` to `- inc` in the repo and run `pytest`.
+
+---
+
+## Ultra-short “chains” you can say out loud
+
+* **Create post:**
+  `main.py (POST /post)` → **validates** (`schemas`) → `posts_service.add_post()` → (maybe) **MinIO upload** → `post_repository.create_post()` → **PostgreSQL** → JSON back.
+
+* **List posts:**
+  `main.py (GET /post)` → `posts_service.get_all_posts()` → `post_repository.get_all_posts()` → **PostgreSQL** → JSON back.
+
+* **Vote:**
+  `main.py (POST /update-post-score)` → **validates** → `posts_service.update_post_score()` → `post_repository.update_post_score()` → **atomic SQL** → updated row back.
+
+* **Show image:**
+  Browser `<img src="/image/{hash}">` → `main.py (GET /image)` → **MinIO get\_object** → stream bytes to browser.
+
+* **Startup & persistence:**
+  `lifespan` runs `create_tables()` + `ensure_bucket()`; data and images persist because Docker volumes are used.
+
+That’s the whole project in the “main → service → repository → storage” shape you described, with where images fit, where validation happens, and how CI verifies it.

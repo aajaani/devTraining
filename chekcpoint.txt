@@ -1,0 +1,284 @@
+awesome—here’s a **text-only, human-readable “flowchart”** of your whole app. it’s organized like a subway map you can *read out loud* to the TA. no graphics, just clean structure, arrows, and short blurbs.
+
+---
+
+# legend
+
+* **\[file]** → main purpose
+* `function()` → what it does
+* → **calls** → next hop
+* ⇦ **returns** → what comes back
+* ⚙ **validates / enforces**
+* 📦 **persists / stores**
+
+---
+
+# bird’s-eye lanes
+
+```
+Frontend (Angular)        →   FastAPI Routes & DI         →    Services & Repos                →   Storage / External
+app.component.*                main.py (routes, startup)        posts_service.py, repo.py            PostgreSQL, MinIO
+post.service.ts                dependencies.py (DI, MinIO)      schemas, ORM, config
+proxy.conf.json                core/exceptions.py               db/models.py, db/database.py
+```
+
+---
+
+# component atlas (who uses whom)
+
+## frontend
+
+* **`src/app/app.component.ts/html/css`**
+
+  * collects inputs; shows posts & images; shows manual-dismiss error popup
+  * → calls **`PostService`** for all network actions
+
+* **`src/app/post.service.ts`**
+
+  * `getPosts()` → **GET** `/post`
+  * `createPost({title,post,username?,image?})` → **POST** `/post` as **FormData** (so image is optional)
+  * `upvote(id)` / `downvote(id)` → **POST** `/update-post-score` `{ post_id, score_increase: ±1 }`
+  * also maps images: `image_url = /image/{hash}`
+
+* **`src/app/post.model.ts`**
+
+  * TS interface mirroring backend JSON: `{ id, title, post, score, username, image_hash? }`
+
+* **`proxy.conf.json`**
+
+  * proxies `/post`, `/update-post-score`, `/image/*` → `http://localhost:8000` (no CORS pain in dev)
+
+---
+
+## backend: routing, DI, error shape
+
+* **`backend/main.py`**
+
+  * **startup (`lifespan`)**: `create_tables()` + `ensure_bucket()` (idempotent)
+  * **routes**
+
+    * `GET /post` → list posts
+    * `POST /post` → create post (Form fields: `title`, `post`, `username?`; File: `image?`)
+    * `POST /update-post-score` → vote `{ post_id, score_increase }`
+    * `GET /image/{hash}` → stream bytes from MinIO
+  * uses **`Depends(get_service(PostService))`** to inject a ready service (with DB session + repo)
+
+* **`backend/dependencies.py`**
+
+  * builds one **MinIO client**, `ensure_bucket()`, `get_minio()`
+  * `get_service(ServiceType)` → tiny DI: constructs a service, wiring its repository with the request-scoped DB session
+
+* **`backend/core/exceptions.py`**
+
+  * `BaseCustomException(...)` → unified error body:
+
+    ```json
+    { "detail": { "user_message": "...", "internal_message": "..." } }
+    ```
+  * frontend shows `user_message` in the popup (manual close; no auto-dismiss)
+
+---
+
+## backend: services, repositories, contracts, ORM
+
+* **`backend/services/posts_service.py`**
+
+  * `add_post(req, image?)`
+
+    * if image: `_compute_sha256(file)` → **hash**, then `_upload_to_minio(image)` → 📦 MinIO `images/{hash}`
+    * → `repo.create_post(req, image_hash)`
+    * ⇦ returns the created row (as ORM model serialized by FastAPI)
+  * `get_all_posts()` → `repo.get_all_posts()`
+  * `update_post_score(req)` → `repo.update_post_score(req)`
+
+* **`backend/repositories/post_repository.py`**
+
+  * `create_post(req, image_hash)` → **INSERT** row → **COMMIT**
+  * `get_all_posts()` → **SELECT** `*` from `posts`
+  * `update_post_score(req)` → **single atomic SQL**
+
+    ```
+    UPDATE posts
+    SET score = score + :inc
+    WHERE id = :id
+    ```
+
+    * avoids race-condition “lost updates” during concurrent votes
+    * then **reads** and returns the updated row
+
+* **`backend/schemas/requests.py`** (Pydantic)
+
+  * `AddNewPostRequest`: ⚙ `title` **required**, `≤100`; `post` **required**; `username` default `"anonymous"`
+  * `UpdatePostScoreRequest`: ⚙ `post_id: int`; `score_increase ∈ {+1,−1}`
+
+* **`backend/db/models.py`**
+
+  * `SavedPost` ORM: `id`, `title NOT NULL`, `username NOT NULL default 'anonymous'`, `post`, `score default 0`, `image_hash?`
+
+* **`backend/db/database.py`**
+
+  * builds **SQLAlchemy engine** + **SessionLocal**
+  * `get_db()` → yields a request-scoped session to DI
+  * `create_tables()` → executes `db/db_init/init.sql` (idempotent create)
+
+* **`backend/config.py`**
+
+  * environment-driven settings for Postgres + MinIO (with sensible local defaults)
+
+---
+
+## persistence / external services
+
+* **PostgreSQL** (Docker named volume)
+
+  * 📦 stores rows in `posts` — all data and scores survive restarts
+  * **atomic** `score = score + inc` happens here
+
+* **MinIO** (S3-compatible; Docker named volume)
+
+  * 📦 stores images under `images/{sha256}`
+  * `GET /image/{hash}` streams object bytes back to the browser
+
+---
+
+# end-to-end flows (call chains with arrows)
+
+## 1) create a post (with optional image)
+
+```
+User (browser)
+  ↓ fills form (title, post, username?, image?)
+Angular app.component
+  → PostService.createPost(FormData)
+  → POST /post  (via proxy.conf to FastAPI)
+FastAPI main.py (POST /post)
+  ⚙ validates with AddNewPostRequest (title required, ≤100)
+  → PostService.add_post(req, image?)
+    → (if image) _compute_sha256(file) → _upload_to_minio(image) → 📦 MinIO images/{hash}
+    → PostRepository.create_post(req, image_hash) → 📦 PostgreSQL INSERT + COMMIT
+    ⇦ created ORM row
+  ⇦ JSON post (includes image_hash if present)
+Angular PostService
+  ⇦ post → app.component reloads list (fresh GET /post)
+UI updates immediately
+```
+
+## 2) list posts (page load or after actions)
+
+```
+app.component.ngOnInit / after action
+  → PostService.getPosts()
+  → GET /post
+FastAPI main.py (GET /post)
+  → PostService.get_all_posts()
+    → PostRepository.get_all_posts() → 📦 PostgreSQL SELECT *
+  ⇦ array of posts
+Angular maps image_hash → image_url (/image/{hash}), renders list
+```
+
+## 3) upvote / downvote
+
+```
+User clicks ▲ / ▼
+Angular app.component
+  → PostService.upvote(id) OR downvote(id)
+  → POST /update-post-score  { post_id, score_increase: +1 | -1 }
+FastAPI main.py
+  ⚙ validates with UpdatePostScoreRequest
+  → PostService.update_post_score(req)
+    → PostRepository.update_post_score(req)
+       → 📦 PostgreSQL  UPDATE score = score + :inc  (atomic)
+       → SELECT updated row
+  ⇦ updated post JSON
+Angular reloads list (ensures “most current content”)
+```
+
+## 4) fetch & display image
+
+```
+Angular template renders <img src="/image/{hash}">
+  → GET /image/{hash}
+FastAPI main.py
+  → dependencies.get_minio().get_object(bucket, "images/{hash}")
+  ⇦ StreamingResponse(bytes, content-type guessed)
+Browser shows the image inline
+```
+
+## 5) startup & persistence (what happens when you restart)
+
+```
+uvicorn main:app starts
+  → lifespan handler:
+     → db.database.create_tables()   (idempotent; no data loss)
+     → dependencies.ensure_bucket()  (idempotent)
+Containers restart
+  → PostgreSQL & MinIO use named volumes → 📦 data and images still there
+```
+
+## 6) error handling (uniform UX)
+
+```
+Any backend failure
+  → raise BaseCustomException(status, user_message, internal_message)
+  ⇦ HTTP { detail: { user_message, internal_message } }
+Angular catchError(...)
+  → show popup with user_message
+  → user must click close (no auto-dismiss)
+```
+
+---
+
+# pipeline / testing lifeline
+
+```
+git push / MR
+  → .gitlab-ci.yml kicks off (both FE & BE):
+     1) hello   : FE build / BE imports
+     2) lint    : ESLint / Ruff
+     3) test    : pytest (backend/tests/test_posts.py)
+     4) format  : Prettier --check / Black --check
+  → any failure → pipeline RED (blocks merge)
+
+backend/tests/test_posts.py
+  - test_default_username_anonymous()
+  - test_list_returns_created()
+  - test_vote_up_then_down_is_zero()
+Live demo failing test: temporarily break repo.update_post_score() logic → pytest fails → revert
+```
+
+---
+
+# “which file uses which” (quick dependency tree)
+
+```
+frontend/app.component.* 
+  └─ uses post.service.ts
+        └─ hits /post, /update-post-score, /image via proxy.conf.json
+
+backend/main.py
+  ├─ on startup → db/database.create_tables()
+  ├─ on startup → dependencies.ensure_bucket()
+  ├─ routes use → Depends(get_service(PostService))
+  │      └─ dependencies.get_service(...) builds PostService(PostRepository(db_session))
+  │              ├─ services/posts_service.py → may call dependencies.get_minio()
+  │              └─ repositories/post_repository.py → uses db/database.SessionLocal engine
+  ├─ validates with → schemas/requests.py (Pydantic)
+  └─ raises → core/exceptions.py (uniform error body)
+
+db/models.py ↔ repositories/post_repository.py (ORM mapping)
+config.py → supplies env vars to db/database.py & dependencies.py
+```
+
+---
+
+# one-liners you can say to show mastery
+
+* “**Voting can’t lose counts** because we update `score` **inside** a single SQL `UPDATE score = score + :inc`.”
+* “**Images are content-addressed**: we hash the file (SHA-256) and store it in MinIO as `images/{hash}`; the DB stores only that hash.”
+* “We **validate twice**: Angular for UX and Pydantic for guarantees (`title` required, ≤100). Username defaults to `anonymous` in frontend, schema, **and** DB.”
+* “**Errors are consistent**: backend always returns `{detail:{user_message,...}}`, and our popup shows that message without auto-dismiss.”
+* “**Persistence is via volumes**: Postgres rows and MinIO objects survive restarts; `create_tables()` and `ensure_bucket()` are idempotent.”
+
+---
+
+if you want, i can tailor this to your exact filenames/paths (or add function signatures), but this should already be a clean, TA-ready, read-aloud “flowchart in text.”
